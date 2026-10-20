@@ -69,6 +69,7 @@ pub mod crop_shield;
 pub mod crop_size;
 pub mod crop_straighten;
 pub mod crop_ui;
+mod ctrl_click;
 pub mod delete_layer_prompt;
 pub mod dialog_alt_reset;
 pub mod dialog_blend_ui;
@@ -2001,6 +2002,13 @@ impl eframe::App for PhotocraftApp {
             wheel_nav::fold_legacy_pinch(ctx, raw_input);
         }
         raw_input.events.extend(self.take_synthetic_step());
+        // ⌃-click is a right click on macOS (ctrl_click.rs).
+        if cfg!(target_os = "macos") {
+            let id = egui::Id::new("ctrl-click-right");
+            let mut converting = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+            ctrl_click::as_right_click(&mut converting, &mut raw_input.events);
+            ctx.data_mut(|d| d.insert_temp(id, converting));
+        }
         // A pen held still is no touch screen's press-and-hold right click (stylus.rs).
         let pen_down = self.stylus.pen_contacts.observe(&raw_input.events);
         stylus::pen_hold_is_no_right_click(ctx, pen_down);
