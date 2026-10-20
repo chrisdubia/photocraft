@@ -1525,7 +1525,46 @@ fn drm_video_memory(drm: &std::path::Path, vendor: u32, device: u32) -> Option<u
     })
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+/// The I/O Registry's `VRAM,totalMB` of the GPU (`ioreg`, which ships with macOS: reading the
+/// registry directly takes IOKit calls, and this crate has no `unsafe`).
+#[cfg(target_os = "macos")]
+fn detect_video_memory(vendor: u32, device: u32) -> Option<u64> {
+    let out = std::process::Command::new("/usr/sbin/ioreg").args(["-r", "-d", "1", "-c", "IOPCIDevice"]).output().ok()?;
+    ioreg_video_memory(&String::from_utf8_lossy(&out.stdout), vendor, device)
+}
+
+/// The video memory (bytes) `ioreg -r -d 1 -c IOPCIDevice` lists for the GPU with PCI `vendor`
+/// and `device` ids. Metal adapters often report no ids (0): then the only GPU with video memory,
+/// or the one with the most (the discrete one, as only discrete adapters ask).
+#[cfg(any(target_os = "macos", test))]
+fn ioreg_video_memory(text: &str, vendor: u32, device: u32) -> Option<u64> {
+    // A little-endian `<de100000>` data value's low 16 bits: 0x10de.
+    let id = |v: &str| {
+        let hex = v.trim().strip_prefix('<')?.strip_suffix('>')?;
+        let b = |i: usize| u32::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+        Some(b(0)? | b(2)? << 8)
+    };
+    let mut gpus: Vec<(Option<u32>, Option<u32>, u64)> = Vec::new();
+    for entry in text.split("+-o ").skip(1) {
+        let (mut v, mut d, mut mb) = (None, None, None);
+        for line in entry.lines() {
+            let Some((key, value)) = line.trim().split_once(" = ") else { continue };
+            match key {
+                "\"vendor-id\"" => v = id(value),
+                "\"device-id\"" => d = id(value),
+                "\"VRAM,totalMB\"" => mb = value.trim().parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        if let Some(mb) = mb.filter(|mb| *mb > 0) {
+            gpus.push((v, d, mb.saturating_mul(1 << 20)));
+        }
+    }
+    let exact = gpus.iter().find(|g| vendor != 0 && g.0 == Some(vendor) && g.1 == Some(device));
+    exact.or_else(|| gpus.iter().max_by_key(|g| g.2)).map(|g| g.2)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn detect_video_memory(_vendor: u32, _device: u32) -> Option<u64> {
     None
 }
@@ -2673,6 +2712,34 @@ mod tests {
         assert_eq!(drm_video_memory(&drm, 0xdead, 0xbeef), None, "no such card");
         assert_eq!(drm_video_memory(&drm.join("missing"), 0x1002, 0x73bf), None, "no drm folder");
         std::fs::remove_dir_all(&drm).unwrap();
+    }
+
+    /// An iMac (Late 2012) with a GeForce GTX 680MX, as `ioreg -r -d 1 -c IOPCIDevice` lists it
+    /// beside devices without video memory.
+    #[test]
+    fn ioreg_video_memory_reads_the_gpus_vram() {
+        let text = r#"+-o IMEI@16  <class IOPCIDevice, id 0x100000213, registered, matched, active, busy 0 (0 ms), retain 12>
+  {
+    "vendor-id" = <86800000>
+    "device-id" = <3a1e0000>
+  }
+
++-o GFX0@0  <class IOPCIDevice, id 0x100000226, registered, matched, active, busy 0 (2 ms), retain 30>
+  {
+    "model" = <"NVIDIA GeForce GTX 680MX">
+    "vendor-id" = <de100000>
+    "device-id" = <a0110000>
+    "VRAM,totalMB" = 2048
+  }
+"#;
+        assert_eq!(ioreg_video_memory(text, 0x10de, 0x11a0), Some(2048 << 20));
+        assert_eq!(ioreg_video_memory(text, 0, 0), Some(2048 << 20), "Metal reports no PCI ids");
+        let igpu = "+-o IGPU@2  <class IOPCIDevice>\n  {\n    \"vendor-id\" = <86800000>\n    \"device-id\" = <62010000>\n    \"VRAM,totalMB\" = 1536\n  }\n";
+        let both = format!("{igpu}\n{text}");
+        assert_eq!(ioreg_video_memory(&both, 0x8086, 0x0162), Some(1536 << 20), "the adapter asked about");
+        assert_eq!(ioreg_video_memory(&both, 0, 0), Some(2048 << 20), "without ids, the larger card");
+        assert_eq!(ioreg_video_memory("", 0x10de, 0x11a0), None);
+        assert_eq!(ioreg_video_memory("+-o X  <class IOPCIDevice>\n  {\n    \"VRAM,totalMB\" = lots\n  }\n", 0, 0), None);
     }
 
     /// Windows used to report no RAM at all, so the budget assumed 16 GB on every machine.
