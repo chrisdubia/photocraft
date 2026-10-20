@@ -35,7 +35,7 @@ case "$ARCH" in
 esac
 
 # Keep in sync with LSMinimumSystemVersion in Info.plist.in.
-export MACOSX_DEPLOYMENT_TARGET=11.0
+export MACOSX_DEPLOYMENT_TARGET=10.15
 IDENTITY="${MACOS_SIGN_IDENTITY:--}"
 SHORT_VERSION="${VERSION%%-*}"
 WORK="$CARGO_TARGET_DIR/macos-package"
