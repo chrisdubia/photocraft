@@ -144,6 +144,24 @@ pub struct CanvasCache {
     pub tex_preview_key: u64,
     /// The CPU path's pixel grid for the part of the document in view (pixel_grid.rs).
     pub grid: Option<crate::pixel_grid::GridLines>,
+    /// A full render of `texture` running off the UI thread ([`full_in_background`]).
+    pub(crate) pending: Option<PendingTexture>,
+}
+
+/// Documents of at least this many pixels recomposite the whole CPU canvas off the UI thread
+/// (with background jobs, the desktop app), and so does a change covering this many: a change to
+/// every layer of a huge document (Duplicate Layer, a blend mode) otherwise stalls the window,
+/// cursor included, for the whole composite. The GPU canvas does the same (`background_redraw`);
+/// this is the CPU canvas a document too large for the GPU's texture budget is drawn on.
+const DEFER_FULL_PX: u64 = 1 << 26;
+
+/// A full CPU canvas render running off the UI thread.
+pub(crate) struct PendingTexture {
+    /// (revision, preview key) it renders, as `CanvasCache::tex_revision` and `tex_preview_key`.
+    key: (u64, u64),
+    /// Document pixels per texel of the image it renders.
+    factor: u32,
+    rx: std::sync::mpsc::Receiver<egui::ColorImage>,
 }
 
 /// An in-progress pointer gesture on the canvas.
@@ -1426,6 +1444,7 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, 
     let seen = app.canvases.get(&cache_key(id, output)).map(|c| (c.tex_revision, c.tex_preview_key));
     let damage = seen.and_then(|seen| damage_since(app, idx, seen, (revision, preview_key), display_key, last_damage));
     let preview_key = preview_key ^ display_key;
+    let background = crate::background_redraw::enabled(app);
     let cache = app.canvases.entry(cache_key(id, output)).or_insert(CanvasCache {
         revision: 0,
         texture: None,
@@ -1435,12 +1454,17 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, 
         tex_revision: 0,
         tex_preview_key: 0,
         grid: None,
+        pending: None,
     });
     if cache.tex_revision != revision || cache.texture.is_none() || cache.tex_preview_key != preview_key {
         let t0 = crate::gpu_canvas::now_ms();
         let longest = doc.size.width.max(doc.size.height);
         let factor = longest.div_ceil(texture_side(ctx)).max(1);
         let (w, h) = ((doc.size.width / factor).max(1), (doc.size.height / factor).max(1));
+        let huge = |px: u64| background && px >= DEFER_FULL_PX;
+        // A change to most of a huge document is a full render, off the UI thread (below).
+        let damage = damage.filter(|d| !huge(d.width() as u64 * d.height() as u64));
+        let name = format!("canvas-{}-{}", id.0, cache_key(id, output).1);
         let current = cache.texture.as_mut().filter(|t| t.size() == [w as usize, h as usize]);
         if let (Some(d), Some(t)) = (damage, current) {
             // Only what the edit or stroke touched: the reduced texture's pixels over it, with the
@@ -1453,22 +1477,86 @@ pub fn ensure_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, 
                 let px = (r.width() as u64 * r.height() as u64).saturating_mul(u64::from(factor).pow(2));
                 app.perf.record("rect", px, t1 - t0, crate::gpu_canvas::now_ms() - t1);
             }
+        } else if cache.texture.is_some() && huge(doc.size.width as u64 * doc.size.height as u64) {
+            // Until the composite lands the texture keeps what it showed, and so do the revision
+            // and preview key it was rendered at.
+            if !full_in_background(cache, ctx, &name, &doc, display.clone(), (revision, preview_key), (w, h), factor) {
+                return Some((cache.texture.as_ref()?.id(), cache.scale));
+            }
         } else {
             // Reduced in bands straight from the compositor: no full-size composite in memory.
             let full = photocraft_compose::render_reduced(&doc, w, h);
             let t1 = crate::gpu_canvas::now_ms();
-            let (img, scale) = (display_image(display.as_deref(), &full), 1.0 / factor as f32);
-            match cache.texture.as_mut() {
-                Some(t) if t.size() == img.size => t.set(img, canvas_texture_options(factor)),
-                _ => cache.texture = Some(ctx.load_texture(format!("canvas-{}-{}", id.0, cache_key(id, output).1), img, canvas_texture_options(factor))),
-            }
-            cache.scale = scale;
+            set_full_texture(cache, ctx, &name, display_image(display.as_deref(), &full), factor);
             app.perf.record("full", doc.size.width as u64 * doc.size.height as u64, t1 - t0, crate::gpu_canvas::now_ms() - t1);
         }
         cache.tex_revision = revision;
         cache.tex_preview_key = preview_key;
     }
     Some((cache.texture.as_ref()?.id(), cache.scale))
+}
+
+/// Show a full render of the canvas, `factor` document pixels per texel, in `cache`'s texture.
+fn set_full_texture(cache: &mut CanvasCache, ctx: &egui::Context, name: &str, img: egui::ColorImage, factor: u32) {
+    match cache.texture.as_mut() {
+        Some(t) if t.size() == img.size => t.set(img, canvas_texture_options(factor)),
+        _ => cache.texture = Some(ctx.load_texture(name, img, canvas_texture_options(factor))),
+    }
+    cache.scale = 1.0 / factor as f32;
+}
+
+/// [`ensure_texture`]'s full render of a huge document on a worker thread ([`DEFER_FULL_PX`]):
+/// starts it, or shows it once it has landed. Returns whether the texture now shows `want`
+/// (revision, preview key). One render runs at a time: one for an older state still shows when
+/// it lands (it is newer than the texture), then the current state renders.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn full_in_background(
+    cache: &mut CanvasCache,
+    ctx: &egui::Context,
+    name: &str,
+    doc: &std::sync::Arc<Document>,
+    display: Option<std::sync::Arc<photocraft_engine::display_color::CanvasDisplay>>,
+    want: (u64, u64),
+    (w, h): (u32, u32),
+    factor: u32,
+) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    if let Some(p) = &cache.pending {
+        match p.rx.try_recv() {
+            Ok(img) => {
+                let (key, done) = (p.key, p.factor);
+                cache.pending = None;
+                set_full_texture(cache, ctx, name, img, done);
+                if key == want {
+                    return true;
+                }
+            }
+            // Still running: its thread asks for a repaint when it is done.
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => cache.pending = None,
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (job_doc, job_display, repaint) = (doc.clone(), display.clone(), ctx.clone());
+    let worker = std::thread::Builder::new().name("canvas-redraw".into()).spawn(move || {
+        let full = photocraft_compose::render_reduced(&job_doc, w, h);
+        if tx.send(display_image(job_display.as_deref(), &full)).is_ok() {
+            repaint.request_repaint();
+        }
+    });
+    match worker {
+        Ok(_) => {
+            cache.pending = Some(PendingTexture { key: want, factor, rx });
+            false
+        }
+        Err(e) => {
+            // No thread: render here, as without background jobs.
+            log::warn!("canvas redraw thread: {e}; rendering on the UI thread");
+            let full = photocraft_compose::render_reduced(doc, w, h);
+            set_full_texture(cache, ctx, name, display_image(display.as_deref(), &full), factor);
+            true
+        }
+    }
 }
 
 /// What changed since a canvas cache showed (`revision`, `preview key`) `seen`, when only a
@@ -1651,6 +1739,7 @@ fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, visible:
         tex_revision: 0,
         tex_preview_key: 0,
         grid: None,
+        pending: None,
     });
     let present = cache.on_gpu && gpu.has(id.0, size);
     let current = cache.revision == revision && cache.preview_key == preview_key;
@@ -8974,3 +9063,53 @@ mod display_memo_tests;
 #[cfg(test)]
 #[path = "canvas/blend_viewport_tests.rs"]
 mod blend_viewport_regression;
+
+#[cfg(test)]
+mod full_in_background_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn cache() -> CanvasCache {
+        CanvasCache { revision: 0, texture: None, scale: 1.0, preview_key: 0, on_gpu: false, tex_revision: 0, tex_preview_key: 0, grid: None, pending: None }
+    }
+
+    fn doc(w: u32, h: u32) -> Arc<Document> {
+        Arc::new(Document::new("t", photocraft_geom::Size::new(w, h), photocraft_doc::ColorMode::Rgb, photocraft_doc::SampleType::U8))
+    }
+
+    /// Calls [`full_in_background`] until it reports `want` shown (a frame each time).
+    fn until_shown(cache: &mut CanvasCache, ctx: &egui::Context, doc: &Arc<Document>, want: (u64, u64), size: (u32, u32), factor: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !full_in_background(cache, ctx, "canvas-t", doc, None, want, size, factor) {
+            assert!(std::time::Instant::now() < deadline, "the background render never landed");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_full_render_runs_off_the_ui_thread_and_lands_in_the_texture() {
+        let ctx = egui::Context::default();
+        let mut c = cache();
+        let d = doc(64, 32);
+        // The first frame only starts it: the UI thread doesn't wait for the composite.
+        assert!(!full_in_background(&mut c, &ctx, "canvas-t", &d, None, (1, 0), (32, 16), 2));
+        assert!(c.pending.is_some());
+        until_shown(&mut c, &ctx, &d, (1, 0), (32, 16), 2);
+        assert!(c.pending.is_none());
+        assert_eq!(c.texture.as_ref().map(|t| t.size()), Some([32, 16]));
+        assert_eq!(c.scale, 0.5);
+    }
+
+    #[test]
+    fn a_render_of_an_older_state_shows_then_the_current_state_renders() {
+        let ctx = egui::Context::default();
+        let mut c = cache();
+        let (old, new) = (doc(16, 16), doc(24, 8));
+        assert!(!full_in_background(&mut c, &ctx, "canvas-t", &old, None, (1, 0), (16, 16), 1));
+        // The document changed while it ran: one render at a time, so the old one finishes first,
+        // shows (it is newer than what the texture had), and the new state follows.
+        until_shown(&mut c, &ctx, &new, (2, 0), (24, 8), 1);
+        assert_eq!(c.texture.as_ref().map(|t| t.size()), Some([24, 8]));
+        assert!(c.pending.is_none());
+    }
+}
