@@ -1538,12 +1538,17 @@ fn detect_video_memory(vendor: u32, device: u32) -> Option<u64> {
 /// or the one with the most (the discrete one, as only discrete adapters ask).
 #[cfg(any(target_os = "macos", test))]
 fn ioreg_video_memory(text: &str, vendor: u32, device: u32) -> Option<u64> {
-    // A little-endian `<de100000>` data value's low 16 bits: 0x10de.
-    let id = |v: &str| {
-        let hex = v.trim().strip_prefix('<')?.strip_suffix('>')?;
-        let b = |i: usize| u32::from_str_radix(hex.get(i..i + 2)?, 16).ok();
-        Some(b(0)? | b(2)? << 8)
+    // A little-endian data value (`<de100000>` is 0x10de), up to 8 bytes; or a plain number,
+    // which some drivers write `VRAM,totalMB` as.
+    let num = |v: &str| -> Option<u64> {
+        let v = v.trim();
+        let Some(hex) = v.strip_prefix('<').and_then(|h| h.strip_suffix('>')) else { return v.parse().ok() };
+        if hex.is_empty() || hex.len() % 2 != 0 || hex.len() > 16 {
+            return None;
+        }
+        (0..hex.len() / 2).rev().try_fold(0u64, |n, i| Some(n << 8 | u64::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?))
     };
+    let id = |v: &str| num(v).map(|n| (n & 0xffff) as u32);
     let mut gpus: Vec<(Option<u32>, Option<u32>, u64)> = Vec::new();
     for entry in text.split("+-o ").skip(1) {
         let (mut v, mut d, mut mb) = (None, None, None);
@@ -1552,7 +1557,7 @@ fn ioreg_video_memory(text: &str, vendor: u32, device: u32) -> Option<u64> {
             match key {
                 "\"vendor-id\"" => v = id(value),
                 "\"device-id\"" => d = id(value),
-                "\"VRAM,totalMB\"" => mb = value.trim().parse::<u64>().ok(),
+                "\"VRAM,totalMB\"" => mb = num(value),
                 _ => {}
             }
         }
@@ -2729,7 +2734,9 @@ mod tests {
     "model" = <"NVIDIA GeForce GTX 680MX">
     "vendor-id" = <de100000>
     "device-id" = <a0110000>
-    "VRAM,totalMB" = 2048
+    "VRAM,totalMB" = <00080000>
+    "VRAM,memvendorID" = <0600>
+    "VRAM,totalsize" = <0000008000000000>
   }
 "#;
         assert_eq!(ioreg_video_memory(text, 0x10de, 0x11a0), Some(2048 << 20));
@@ -2739,6 +2746,7 @@ mod tests {
         assert_eq!(ioreg_video_memory(&both, 0x8086, 0x0162), Some(1536 << 20), "the adapter asked about");
         assert_eq!(ioreg_video_memory(&both, 0, 0), Some(2048 << 20), "without ids, the larger card");
         assert_eq!(ioreg_video_memory("", 0x10de, 0x11a0), None);
+        assert_eq!(ioreg_video_memory("+-o X  <class IOPCIDevice>\n  {\n    \"VRAM,totalMB\" = <000>\n  }\n", 0, 0), None, "odd hex");
         assert_eq!(ioreg_video_memory("+-o X  <class IOPCIDevice>\n  {\n    \"VRAM,totalMB\" = lots\n  }\n", 0, 0), None);
     }
 
