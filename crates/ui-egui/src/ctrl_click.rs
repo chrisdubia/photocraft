@@ -83,14 +83,15 @@ mod tests {
                 events.push(button(PointerButton::Primary, false, Modifiers::CTRL));
             }
             as_right_click(&mut converting, &mut events);
-            let input = egui::RawInput { events, modifiers: if frame == 1 { Modifiers::CTRL } else { Modifiers::NONE }, ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            let input = egui::RawInput { events, ..Default::default() };
+            ctx.run_ui(input, |ui| {
                 let resp = ui.add(egui::Label::new("Background").sense(egui::Sense::click()));
                 resp.context_menu(|ui| {
                     opened = true;
                     ui.label("Duplicate Layer…");
                 });
-            });
+            })
+            .drop_without_applying_deltas();
         }
         assert!(opened);
     }
